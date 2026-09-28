@@ -10,5 +10,3 @@
 - Mod template man
 - chat gpt
 - Likecristi, and others for suggestions and starship
-
-![Uploading image.png…]()
