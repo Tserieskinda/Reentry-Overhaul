@@ -7,3 +7,4 @@ Tutorial man
 Claude
 Mod template man
 chat gpt
+ilike space, and others for suggestions and starship
