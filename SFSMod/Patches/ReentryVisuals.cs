@@ -16,6 +16,21 @@ using Type = SFS.UI.ModGUI.Type;
 namespace SFSMod.Patches
 {
     // ============================================================
+    // SHARED PHYSICS HELPER - one place for "what is this rocket's
+    // current velocity", instead of duplicating the Aero_Rocket cast
+    // in both the particle code and the new velocity-based hue code.
+    // ============================================================
+
+    public static class ReentryPhysics
+    {
+        public static Vector2 GetVelocity(AeroModule instance)
+        {
+            return (instance is Aero_Rocket aeroRocket) ? aeroRocket.rocket.rb2d.linearVelocity : Vector2.zero;
+        }
+    }
+
+
+    // ============================================================
     // BASE SHAPE - the game's own stock values, captured once.
     // Every layer (original or extra) scales FROM these, so nothing
     // compounds across ticks regardless of how many layers exist.
@@ -66,6 +81,9 @@ namespace SFSMod.Patches
             public bool isOriginal;
 
             public float hue;
+            public float coldHue;
+            public float hueMinVel;
+            public float hueMaxVel;
             public float brightness;
             public float opacity;
             public float offset;
@@ -87,7 +105,8 @@ namespace SFSMod.Patches
         public static readonly LayerSettings edgeA = new LayerSettings
         {
             id = "edgeA", isEdge = true, isOriginal = true,
-            hue = 20f, brightness = 3f, opacity = 1f, offset = 0f, animationSpeed = 0f,
+            hue = 20f, coldHue = 20f, hueMinVel = 200f, hueMaxVel = 1500f,
+            brightness = 3f, opacity = 1f, offset = 0f, animationSpeed = 0f,
             widthScale = 0.7f, lengthScale = 0.7f, fadeXScale = 1f, fadeMScale = 1f,
             straightness = 1f, sortingOrder = 1
         };
@@ -95,7 +114,8 @@ namespace SFSMod.Patches
         public static readonly LayerSettings outerA = new LayerSettings
         {
             id = "outerA", isEdge = false, isOriginal = true,
-            hue = 260f, brightness = 3f, opacity = 1f, offset = 0f, animationSpeed = 0f,
+            hue = 260f, coldHue = 20f, hueMinVel = 200f, hueMaxVel = 1500f,
+            brightness = 3f, opacity = 1f, offset = 0f, animationSpeed = 0f,
             widthScale = 0.7f, lengthScale = 0.6f, fadeXScale = 1f, fadeMScale = 1f,
             straightness = 1f, sortingOrder = 1
         };
@@ -142,7 +162,7 @@ namespace SFSMod.Patches
             LayerSettings l = new LayerSettings
             {
                 id = id, isEdge = isEdge, isOriginal = false,
-                hue = isEdge ? 45f : 300f,
+                hue = isEdge ? 45f : 300f, coldHue = isEdge ? 45f : 20f, hueMinVel = 200f, hueMaxVel = 1500f,
                 brightness = 1.2f, opacity = 0.5f, offset = 0f, animationSpeed = 0f,
                 widthScale = 1.1f, lengthScale = 1.1f, fadeXScale = 1f, fadeMScale = 1f,
                 straightness = 1f, sortingOrder = 0
@@ -199,6 +219,26 @@ namespace SFSMod.Patches
         public static void RegisterClone(AeroMesh clone, LayerSettings settings) =>
             meshOwner.Set(clone, settings);
 
+        // --------------------------------------------------------
+        // Current speed per mesh instance (original or clone), set
+        // right before that mesh's GenerateMesh/SetTemperature runs
+        // each tick (see AeroMesh_ShapeTuningA and
+        // AeroMesh_DuplicateLayers), read back inside
+        // ApplyPropertyBlock below to drive the cold/hot hue blend.
+        // Keyed per-mesh rather than a single global value so multiple
+        // simultaneous rockets each get their own correct speed, even
+        // though the hueMinVel/hueMaxVel/coldHue RANGE settings
+        // themselves are shared per LayerSettings (consistent with
+        // brightness/width/etc already being shared that way).
+        // --------------------------------------------------------
+
+        private static readonly Dictionary<AeroMesh, float> currentSpeed = new Dictionary<AeroMesh, float>();
+
+        public static void SetCurrentSpeed(AeroMesh mesh, float speed) => currentSpeed[mesh] = speed;
+
+        private static float GetCurrentSpeed(AeroMesh mesh) =>
+            currentSpeed.TryGetValue(mesh, out float s) ? s : 0f;
+
         static readonly int HueProp = Shader.PropertyToID("_Hue");
         static readonly int AlphaMultProp = Shader.PropertyToID("_AlphaMultiplier");
         static readonly int OffsetProp = Shader.PropertyToID("_Offset");
@@ -229,7 +269,22 @@ namespace SFSMod.Patches
             MaterialPropertyBlock block = new MaterialPropertyBlock();
             mesh.meshRenderer.GetPropertyBlock(block);
 
-            block.SetFloat(HueProp, settings.hue);
+            // Blend between coldHue (at/below hueMinVel) and hue (at/above
+            // hueMaxVel) based on this mesh's current speed - e.g. stays
+            // near-native/white-ish at low velocity instead of pink/purple
+            // the instant any heating starts, and smoothly saturates into
+            // the full tuned hue as speed climbs. Set hueMinVel ==
+            // hueMaxVel (or leave hueMaxVel <= hueMinVel) to disable this
+            // and just always show "hue" as before.
+            float effectiveHue = settings.hue;
+            if (settings.hueMaxVel > settings.hueMinVel)
+            {
+                float speed = GetCurrentSpeed(mesh);
+                float t = Mathf.Clamp01((speed - settings.hueMinVel) / (settings.hueMaxVel - settings.hueMinVel));
+                effectiveHue = Mathf.Lerp(settings.coldHue, settings.hue, t);
+            }
+            block.SetFloat(HueProp, effectiveHue);
+
             block.SetFloat(AlphaMultProp, settings.opacity);
 
             // animationSpeed drives real motion: the streak pattern
@@ -264,7 +319,8 @@ namespace SFSMod.Patches
 
         public static readonly string[] ParamNames =
         {
-            "hue", "brightness", "opacity", "offset", "speed",
+            "hue", "coldhue", "huemin", "huemax",
+            "brightness", "opacity", "offset", "speed",
             "posx", "posy",
             "width", "length", "fadex", "fadem", "straightness", "order"
         };
@@ -274,6 +330,9 @@ namespace SFSMod.Patches
             switch (parameter)
             {
                 case "hue": layer.hue = value; break;
+                case "coldhue": layer.coldHue = value; break;
+                case "huemin": layer.hueMinVel = value; break;
+                case "huemax": layer.hueMaxVel = value; break;
                 case "brightness": layer.brightness = value; break;
                 case "opacity": layer.opacity = value; break;
                 case "offset": layer.offset = value; break;
@@ -294,6 +353,9 @@ namespace SFSMod.Patches
             switch (parameter)
             {
                 case "hue": return layer.hue;
+                case "coldhue": return layer.coldHue;
+                case "huemin": return layer.hueMinVel;
+                case "huemax": return layer.hueMaxVel;
                 case "brightness": return layer.brightness;
                 case "opacity": return layer.opacity;
                 case "offset": return layer.offset;
@@ -385,9 +447,7 @@ namespace SFSMod.Patches
             // (which the camera follows) can be moving at hundreds or
             // thousands of m/s during reentry - so they get left behind
             // almost instantly, reading as "spawn off screen."
-            Vector2 rocketVelocity = (instance is Aero_Rocket aeroRocket)
-                ? aeroRocket.rocket.rb2d.linearVelocity
-                : Vector2.zero;
+            Vector2 rocketVelocity = ReentryPhysics.GetVelocity(instance);
 
             (Vector3, Vector3)[] particles = new (Vector3, Vector3)[count];
             for (int i = 0; i < count; i++)
@@ -667,13 +727,20 @@ namespace SFSMod.Patches
     [HarmonyPatch(typeof(AeroModule), "FixedUpdate_Reentry_And_Heating")]
     class AeroMesh_ShapeTuningA
     {
-        static void Prefix()
+        static void Prefix(AeroModule __instance)
         {
             if (GameManager.main == null) return;
             AeroData aeroData = GameManager.main.aeroData;
             if (aeroData == null) return;
 
             ReentryBaseShape.CaptureIfNeeded(aeroData);
+
+            // Feed this rocket's real speed into edgeA/outerA before the
+            // game's own SetTemperature calls happen inside the original
+            // method body - ApplyPropertyBlock reads it back afterward.
+            float speed = ReentryPhysics.GetVelocity(__instance).magnitude;
+            ReentryLayers.SetCurrentSpeed(__instance.reentryEdge, speed);
+            ReentryLayers.SetCurrentSpeed(__instance.reentryOuter, speed);
 
             aeroData.reentry_Edge.size = ReentryBaseShape.edgeSize * ReentryLayers.edgeA.lengthScale;
             aeroData.reentry_Edge.side_FadeX = ReentryBaseShape.edgeFadeX * ReentryLayers.edgeA.widthScale * ReentryLayers.edgeA.fadeXScale;
@@ -729,12 +796,18 @@ namespace SFSMod.Patches
 
             ReentryBaseShape.CaptureIfNeeded(aeroData);
 
+            // Same speed value applies to every extra layer on this
+            // rocket - computed once per tick here, fed to each clone
+            // below (ApplyPropertyBlock reads it back per-mesh).
+            float speed = ReentryPhysics.GetVelocity(__instance).magnitude;
+
             // Copy the extras list since layers can be added/removed
             // (from the UI) between ticks.
             foreach (ReentryLayers.LayerSettings layer in ReentryLayers.extraLayers.ToList())
             {
                 AeroMesh original = layer.isEdge ? __instance.reentryEdge : __instance.reentryOuter;
                 AeroMesh clone = GetOrCreateClone(layer, original);
+                ReentryLayers.SetCurrentSpeed(clone, speed);
 
                 if (layer.isEdge)
                 {
@@ -921,7 +994,7 @@ namespace SFSMod.Patches
             {
                 Match m = Regex.Match(
                     s,
-                    @"^set (\S+) (hue|brightness|opacity|offset|speed|posx|posy|width|length|fadex|fadem|straightness|order) ([\d.\-]+)$",
+                    @"^set (\S+) (hue|coldhue|huemin|huemax|brightness|opacity|offset|speed|posx|posy|width|length|fadex|fadem|straightness|order) ([\d.\-]+)$",
                     RegexOptions.IgnoreCase
                 );
                 if (!m.Success) return false;
@@ -1009,7 +1082,8 @@ namespace SFSMod.Patches
 
         class LayerDefaults
         {
-            public float hue, brightness, opacity, offset, speed;
+            public float hue, coldHue, hueMinVel, hueMaxVel;
+            public float brightness, opacity, offset, speed;
             public float posX, posY;
             public float width, length, fadeX, fadeM, straightness;
             public int order;
@@ -1141,7 +1215,17 @@ namespace SFSMod.Patches
 
         static void BuildLayerColumn(Transform parent, ReentryLayers.LayerSettings layer)
         {
-            Box column = Builder.CreateBox(parent, ColumnWidth, ColumnHeight, opacity: 0.15f);
+            // FIX: previously passed ColumnHeight (880) here directly at
+            // construction time, before SetFixedWidthAutoHeight's
+            // ContentSizeFitter ever ran - if CreateBox sizes its own
+            // background visual from these constructor args immediately,
+            // that background could stay at the old oversized height even
+            // after the fitter later shrinks the RectTransform used for
+            // positioning, leaving a leftover background-colored gap. A
+            // small placeholder here (and in BuildParticlesColumn /
+            // BuildAddColumn below) means there's nothing oversized left
+            // for the fitter to disagree with.
+            Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.15f);
             SetFixedWidthAutoHeight(column.gameObject, ColumnWidth);
             column.CreateLayoutGroup(Type.Vertical, TextAnchor.UpperCenter, RowSpacing, new RectOffset(10, 10, 15, 15));
 
@@ -1151,7 +1235,8 @@ namespace SFSMod.Patches
             {
                 Defaults[layer] = new LayerDefaults
                 {
-                    hue = layer.hue, brightness = layer.brightness, opacity = layer.opacity,
+                    hue = layer.hue, coldHue = layer.coldHue, hueMinVel = layer.hueMinVel, hueMaxVel = layer.hueMaxVel,
+                    brightness = layer.brightness, opacity = layer.opacity,
                     offset = layer.offset, speed = layer.animationSpeed,
                     posX = layer.posX, posY = layer.posY,
                     width = layer.widthScale, length = layer.lengthScale,
@@ -1166,6 +1251,9 @@ namespace SFSMod.Patches
             Builder.CreateLabel(column, ColumnWidth - 20, 40, 0, 0, layer.id + (layer.isOriginal ? " (real)" : ""));
 
             BuildRow(column, layer, "Hue", "hue", 5f, layer.hue);
+            BuildRow(column, layer, "Cold Hue", "coldhue", 5f, layer.coldHue);
+            BuildRow(column, layer, "Hue Min Vel", "huemin", 10f, layer.hueMinVel);
+            BuildRow(column, layer, "Hue Max Vel", "huemax", 10f, layer.hueMaxVel);
             BuildRow(column, layer, "Brightness", "brightness", 0.1f, layer.brightness);
             BuildRow(column, layer, "Opacity", "opacity", 0.05f, layer.opacity);
             BuildRow(column, layer, "Offset", "offset", 0.05f, layer.offset);
@@ -1198,7 +1286,7 @@ namespace SFSMod.Patches
             // same reasoning as BuildAddColumn above.
             const int particlesBoxHeight = 380;
 
-            Box column = Builder.CreateBox(parent, ColumnWidth, particlesBoxHeight, opacity: 0.15f);
+            Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.15f);
             SetFixedWidthAutoHeight(column.gameObject, ColumnWidth);
             column.CreateLayoutGroup(Type.Vertical, TextAnchor.UpperCenter, RowSpacing, new RectOffset(10, 10, 15, 15));
 
@@ -1232,7 +1320,7 @@ namespace SFSMod.Patches
             // box the same height as a full parameter panel would look odd.
             const int addBoxHeight = 300;
 
-            Box column = Builder.CreateBox(parent, ColumnWidth, addBoxHeight, opacity: 0.1f);
+            Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.1f);
             SetFixedWidthAutoHeight(column.gameObject, ColumnWidth);
             column.CreateLayoutGroup(Type.Vertical, TextAnchor.UpperCenter, 20f, new RectOffset(10, 10, 15, 15));
 
@@ -1355,6 +1443,9 @@ namespace SFSMod.Patches
             if (!Defaults.TryGetValue(layer, out LayerDefaults d)) return;
 
             layer.hue = d.hue;
+            layer.coldHue = d.coldHue;
+            layer.hueMinVel = d.hueMinVel;
+            layer.hueMaxVel = d.hueMaxVel;
             layer.brightness = d.brightness;
             layer.opacity = d.opacity;
             layer.offset = d.offset;
