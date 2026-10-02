@@ -92,6 +92,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="MyMod.cs" />
+    <Compile Include="Patches\BuiltInPresets.cs" />
     <Compile Include="Patches\ReentryVisuals.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Settings.cs" />

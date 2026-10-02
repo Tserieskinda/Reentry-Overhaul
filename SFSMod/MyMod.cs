@@ -14,7 +14,7 @@ namespace SFSMod
         public override string DisplayName => "Reentry Overhaul";
         public override string Author => "Tserieskinda";
         public override string MinimumGameVersionNecessary => "0.3.7";
-        public override string ModVersion => "1.2.0";
+        public override string ModVersion => "1.4.0";
         public override string IconLink => "https://raw.githubusercontent.com/Tserieskinda/Reentry-Overhaul/main/icon";
         public override string Description => "A simple mod that adds reentry effects adjustments, enjoy the pre existing one or make your own by F3 button.";
 

@@ -12,13 +12,15 @@ using UnityEngine;
 using UnityEngine.UI;
 using Object = UnityEngine.Object;
 using Type = SFS.UI.ModGUI.Type;
+using Button = SFS.UI.ModGUI.Button;
 
 namespace SFSMod.Patches
 {
     // ============================================================
-    // SHARED PHYSICS HELPER - one place for "what is this rocket's
-    // current velocity", instead of duplicating the Aero_Rocket cast
-    // in both the particle code and the new velocity-based hue code.
+    // SHARED PHYSICS/LOCATION HELPER - one place for "what is this
+    // rocket's current velocity" and "which planet is it at right
+    // now", used by both the particle code and the per-planet
+    // profile resolution below.
     // ============================================================
 
     public static class ReentryPhysics
@@ -27,6 +29,21 @@ namespace SFSMod.Patches
         {
             return (instance is Aero_Rocket aeroRocket) ? aeroRocket.rocket.rb2d.linearVelocity : Vector2.zero;
         }
+
+        // Falls back to "Earth" if anything along the chain isn't ready
+        // yet (very first frame, non-Aero_Rocket instance, etc.) rather
+        // than throwing - a missing planet reference shouldn't crash
+        // reentry rendering.
+        public static string GetPlanetCodeName(AeroModule instance)
+        {
+            if (instance is Aero_Rocket aeroRocket && aeroRocket.rocket != null && aeroRocket.rocket.location != null)
+            {
+                SFS.WorldBase.Planet planet = aeroRocket.rocket.location.planet.Value;
+                if (planet != null && !string.IsNullOrEmpty(planet.codeName))
+                    return planet.codeName;
+            }
+            return "Earth";
+        }
     }
 
 
@@ -34,6 +51,8 @@ namespace SFSMod.Patches
     // BASE SHAPE - the game's own stock values, captured once.
     // Every layer (original or extra) scales FROM these, so nothing
     // compounds across ticks regardless of how many layers exist.
+    // Shared across every planet's profile - it's just capturing the
+    // game's own unmodified defaults once, not per-planet data.
     // ============================================================
 
     public static class ReentryBaseShape
@@ -66,10 +85,11 @@ namespace SFSMod.Patches
 
 
     // ============================================================
-    // REENTRY LAYER SETTINGS - now an open-ended list instead of
-    // 4 fixed names. edgeA/outerA are the two special "original"
-    // layers tied to the game's own real mesh (can't be removed).
-    // Everything else is a duplicate, added/removed at runtime.
+    // REENTRY LAYER SETTINGS - pure per-layer data plus the shared
+    // utilities that operate on a LayerSettings/AeroMesh pair. The
+    // layer LIST itself (edgeA/outerA/extraLayers) now lives on
+    // ReentryProfile below, one per planet, instead of as fixed
+    // globals here.
     // ============================================================
 
     public static class ReentryLayers
@@ -102,7 +122,7 @@ namespace SFSMod.Patches
             public int sortingOrder;
         }
 
-        public static readonly LayerSettings edgeA = new LayerSettings
+        public static LayerSettings MakeDefaultEdgeA() => new LayerSettings
         {
             id = "edgeA", isEdge = true, isOriginal = true,
             hue = 20f, coldHue = 20f, hueMinVel = 200f, hueMaxVel = 1500f,
@@ -111,7 +131,7 @@ namespace SFSMod.Patches
             straightness = 1f, sortingOrder = 1
         };
 
-        public static readonly LayerSettings outerA = new LayerSettings
+        public static LayerSettings MakeDefaultOuterA() => new LayerSettings
         {
             id = "outerA", isEdge = false, isOriginal = true,
             hue = 260f, coldHue = 20f, hueMinVel = 200f, hueMaxVel = 1500f,
@@ -120,118 +140,34 @@ namespace SFSMod.Patches
             straightness = 1f, sortingOrder = 1
         };
 
-        public static readonly List<LayerSettings> extraLayers = new List<LayerSettings>();
-
-        private static int nextExtraId = 1;
-
-        public static IEnumerable<LayerSettings> AllLayers()
+        public static LayerSettings MakeExtraDefault(string id, bool isEdge) => new LayerSettings
         {
-            yield return edgeA;
-            yield return outerA;
-            foreach (LayerSettings l in extraLayers)
-                yield return l;
-        }
-
-        public static Dictionary<string, LayerSettings> byId =>
-            AllLayers().ToDictionary(l => l.id, l => l, StringComparer.OrdinalIgnoreCase);
-
-        /// <summary>Used by the "+" UI buttons / "addedge"/"addouter" console commands.</summary>
-        public static LayerSettings AddLayer(bool isEdge)
-        {
-            string id = (isEdge ? "edge" : "outer") + nextExtraId;
-            nextExtraId++;
-            return AddLayerWithId(id, isEdge);
-        }
-
-        /// <summary>Used by Load() to recreate saved extra layers with their original ids.</summary>
-        public static LayerSettings EnsureLayer(string id, bool isEdge)
-        {
-            if (byId.TryGetValue(id, out LayerSettings existing))
-                return existing;
-
-            // Keep future auto-generated ids from colliding with a loaded one.
-            string digits = new string(id.Where(char.IsDigit).ToArray());
-            if (int.TryParse(digits, out int n) && n >= nextExtraId)
-                nextExtraId = n + 1;
-
-            return AddLayerWithId(id, isEdge);
-        }
-
-        private static LayerSettings AddLayerWithId(string id, bool isEdge)
-        {
-            LayerSettings l = new LayerSettings
-            {
-                id = id, isEdge = isEdge, isOriginal = false,
-                hue = isEdge ? 45f : 300f, coldHue = isEdge ? 45f : 20f, hueMinVel = 200f, hueMaxVel = 1500f,
-                brightness = 1.2f, opacity = 0.5f, offset = 0f, animationSpeed = 0f,
-                widthScale = 1.1f, lengthScale = 1.1f, fadeXScale = 1f, fadeMScale = 1f,
-                straightness = 1f, sortingOrder = 0
-            };
-            extraLayers.Add(l);
-            return l;
-        }
-
-        public static void RemoveLayer(LayerSettings layer)
-        {
-            if (layer.isOriginal) return; // never remove the real meshes
-            extraLayers.Remove(layer);
-            AeroMesh_DuplicateLayers.DestroyClonesFor(layer);
-            meshOwner.RemoveAll(layer);
-        }
+            id = id, isEdge = isEdge, isOriginal = false,
+            hue = isEdge ? 45f : 300f, coldHue = isEdge ? 45f : 20f, hueMinVel = 200f, hueMaxVel = 1500f,
+            brightness = 1.2f, opacity = 0.5f, offset = 0f, animationSpeed = 0f,
+            widthScale = 1.1f, lengthScale = 1.1f, fadeXScale = 1f, fadeMScale = 1f,
+            straightness = 1f, sortingOrder = 0
+        };
 
         // --------------------------------------------------------
-        // Which LayerSettings a given AeroMesh belongs to. Originals
-        // are matched by exact name once, then cached; clones are
-        // registered explicitly at creation time (see
-        // AeroMesh_DuplicateLayers) - no string-guessing for those.
+        // Which LayerSettings a given AeroMesh is CURRENTLY showing.
+        // Re-registered every tick (see AeroMesh_ShapeTuningA /
+        // AeroMesh_DuplicateLayers), same pattern as currentSpeed
+        // below - so a rocket that moves to a different planet picks
+        // up that planet's profile immediately, with nothing stale
+        // left over from a one-time name-based match.
         // --------------------------------------------------------
 
-        private static class meshOwner
-        {
-            private static readonly Dictionary<AeroMesh, LayerSettings> map =
-                new Dictionary<AeroMesh, LayerSettings>();
+        private static readonly Dictionary<AeroMesh, LayerSettings> meshOwner = new Dictionary<AeroMesh, LayerSettings>();
 
-            public static LayerSettings Get(AeroMesh mesh)
-            {
-                if (map.TryGetValue(mesh, out LayerSettings s))
-                    return s;
+        public static void SetOwner(AeroMesh mesh, LayerSettings settings) => meshOwner[mesh] = settings;
 
-                if (mesh.name == "Reentry Edge") return Set(mesh, edgeA);
-                if (mesh.name == "Reentry Outer") return Set(mesh, outerA);
-                return null;
-            }
+        public static LayerSettings GetSettings(AeroMesh mesh) =>
+            meshOwner.TryGetValue(mesh, out LayerSettings s) ? s : null;
 
-            public static LayerSettings Set(AeroMesh mesh, LayerSettings settings)
-            {
-                map[mesh] = settings;
-                return settings;
-            }
-
-            public static void RemoveAll(LayerSettings layer)
-            {
-                foreach (AeroMesh key in map.Where(kv => kv.Value == layer).Select(kv => kv.Key).ToList())
-                    map.Remove(key);
-            }
-        }
-
-        public static LayerSettings GetSettings(AeroMesh mesh) => meshOwner.Get(mesh);
-
-        public static void RegisterClone(AeroMesh clone, LayerSettings settings) =>
-            meshOwner.Set(clone, settings);
-
-        // --------------------------------------------------------
-        // Current speed per mesh instance (original or clone), set
-        // right before that mesh's GenerateMesh/SetTemperature runs
-        // each tick (see AeroMesh_ShapeTuningA and
-        // AeroMesh_DuplicateLayers), read back inside
-        // ApplyPropertyBlock below to drive the cold/hot hue blend.
-        // Keyed per-mesh rather than a single global value so multiple
-        // simultaneous rockets each get their own correct speed, even
-        // though the hueMinVel/hueMaxVel/coldHue RANGE settings
-        // themselves are shared per LayerSettings (consistent with
-        // brightness/width/etc already being shared that way).
-        // --------------------------------------------------------
-
+        // Current speed per mesh instance, set right before that mesh's
+        // GenerateMesh/SetTemperature runs each tick, read back inside
+        // ApplyPropertyBlock to drive the cold/hot hue blend.
         private static readonly Dictionary<AeroMesh, float> currentSpeed = new Dictionary<AeroMesh, float>();
 
         public static void SetCurrentSpeed(AeroMesh mesh, float speed) => currentSpeed[mesh] = speed;
@@ -243,39 +179,15 @@ namespace SFSMod.Patches
         static readonly int AlphaMultProp = Shader.PropertyToID("_AlphaMultiplier");
         static readonly int OffsetProp = Shader.PropertyToID("_Offset");
 
-        // --------------------------------------------------------
-        // FIX: no more base-position caching. AeroMesh.GenerateMesh
-        // (called every tick, immediately before SetTemperature, for
-        // both original meshes and clones) already force-sets
-        // transform.position/eulerAngles in WORLD space, billboarded
-        // purely to the velocity direction - independent of the
-        // craft's own rotation and of any parent transform. There is
-        // nothing to cache: GenerateMesh re-establishes ground truth
-        // from scratch every tick.
-        //
-        // Previously this code wrote mesh.transform.localPosition
-        // against a basePos captured once. Because localPosition is
-        // resolved through the parent transform (which DOES rotate
-        // with the craft), that stale local baseline diverged further
-        // from correct the more the craft's actual rotation drifted
-        // from whatever it was at capture time - small when stable,
-        // large while tumbling. Instead we now rotate the raw offset
-        // by the craft's current body angle and add it directly onto
-        // the world position GenerateMesh just wrote this tick.
-        // --------------------------------------------------------
-
         public static void ApplyPropertyBlock(AeroMesh mesh, LayerSettings settings)
         {
             MaterialPropertyBlock block = new MaterialPropertyBlock();
             mesh.meshRenderer.GetPropertyBlock(block);
 
             // Blend between coldHue (at/below hueMinVel) and hue (at/above
-            // hueMaxVel) based on this mesh's current speed - e.g. stays
-            // near-native/white-ish at low velocity instead of pink/purple
-            // the instant any heating starts, and smoothly saturates into
-            // the full tuned hue as speed climbs. Set hueMinVel ==
-            // hueMaxVel (or leave hueMaxVel <= hueMinVel) to disable this
-            // and just always show "hue" as before.
+            // hueMaxVel) based on this mesh's current speed. Set
+            // hueMinVel == hueMaxVel (or leave hueMaxVel <= hueMinVel) to
+            // disable the blend and just always show "hue" as before.
             float effectiveHue = settings.hue;
             if (settings.hueMaxVel > settings.hueMinVel)
             {
@@ -297,15 +209,6 @@ namespace SFSMod.Patches
 
             if (settings.posX != 0f || settings.posY != 0f)
             {
-                // NOTE: assumes mesh.transform.parent tracks the craft's
-                // actual body rotation (true for both original meshes
-                // and clones, since clones are Instantiated with
-                // original.transform.parent - see GetOrCreateClone
-                // below). If in testing the offset stays glued to the
-                // velocity/world frame instead of following the craft,
-                // this angle needs to come from the AeroModule/Rocket
-                // transform instead (threaded down from
-                // AeroMesh_DuplicateLayers.Postfix's __instance).
                 float craftAngleRad = mesh.transform.parent.eulerAngles.z * Mathf.Deg2Rad;
                 float cos = Mathf.Cos(craftAngleRad);
                 float sin = Mathf.Sin(craftAngleRad);
@@ -375,51 +278,176 @@ namespace SFSMod.Patches
 
 
     // ============================================================
-    // BURN PARTICLES - reuses the game's own "effects/Burn"
-    // WorldParticle prefab (already used for things like separator
-    // sparks/debris), so particles inherit the game's own gravity,
-    // drag, and floating-origin handling instead of us reinventing it.
+    // REENTRY PROFILE - everything that's now PER PLANET: the two
+    // original layers, every extra layer, and the burn-particle
+    // settings. One of these exists per planet codeName, created
+    // lazily by ReentryProfiles below.
     // ============================================================
 
-    public static class ReentryBurnParticles
+    public class ReentryProfile
     {
-        public static bool enabled = false;
-        public static float particlesPerSecond = 20f;
-        public static float velocityRange = 3f;
-        public static float spawnSpread = 1.2f;
+        public ReentryLayers.LayerSettings edgeA = ReentryLayers.MakeDefaultEdgeA();
+        public ReentryLayers.LayerSettings outerA = ReentryLayers.MakeDefaultOuterA();
+        public readonly List<ReentryLayers.LayerSettings> extraLayers = new List<ReentryLayers.LayerSettings>();
+        private int nextExtraId = 1;
 
-        private static WorldParticle prefab;
-        private static bool loadFailed;
-        private static float accumulator;
+        public bool particlesEnabled;
+        public float particlesRate = 20f;
+        public float particlesVelocity = 3f;
+        public float particlesSpread = 1.2f;
 
-        public static readonly string[] ParamNames = { "enabled", "rate", "velocity", "spread" };
+        public static readonly string[] ParticleParamNames = { "enabled", "rate", "velocity", "spread" };
 
-        public static void SetParam(string parameter, float value)
+        public void SetParticleParam(string parameter, float value)
         {
             switch (parameter)
             {
-                case "enabled": enabled = value >= 0.5f; break;
-                case "rate": particlesPerSecond = value; break;
-                case "velocity": velocityRange = value; break;
-                case "spread": spawnSpread = value; break;
+                case "enabled": particlesEnabled = value >= 0.5f; break;
+                case "rate": particlesRate = value; break;
+                case "velocity": particlesVelocity = value; break;
+                case "spread": particlesSpread = value; break;
             }
         }
 
-        public static float GetParam(string parameter)
+        public float GetParticleParam(string parameter)
         {
             switch (parameter)
             {
-                case "enabled": return enabled ? 1f : 0f;
-                case "rate": return particlesPerSecond;
-                case "velocity": return velocityRange;
-                case "spread": return spawnSpread;
+                case "enabled": return particlesEnabled ? 1f : 0f;
+                case "rate": return particlesRate;
+                case "velocity": return particlesVelocity;
+                case "spread": return particlesSpread;
                 default: return 0f;
             }
         }
 
-        public static void Tick(AeroModule instance, float temperature)
+        public IEnumerable<ReentryLayers.LayerSettings> AllLayers()
         {
-            if (!enabled || temperature <= 0f || loadFailed)
+            yield return edgeA;
+            yield return outerA;
+            foreach (ReentryLayers.LayerSettings l in extraLayers)
+                yield return l;
+        }
+
+        public Dictionary<string, ReentryLayers.LayerSettings> ById =>
+            AllLayers().ToDictionary(l => l.id, l => l, StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Used by the "+" UI buttons / "addedge"/"addouter" console commands.</summary>
+        public ReentryLayers.LayerSettings AddLayer(bool isEdge)
+        {
+            string id = (isEdge ? "edge" : "outer") + nextExtraId;
+            nextExtraId++;
+            ReentryLayers.LayerSettings l = ReentryLayers.MakeExtraDefault(id, isEdge);
+            extraLayers.Add(l);
+            return l;
+        }
+
+        /// <summary>Used when loading from file to recreate saved extra layers with their original ids.</summary>
+        public ReentryLayers.LayerSettings EnsureLayer(string id, bool isEdge)
+        {
+            if (ById.TryGetValue(id, out ReentryLayers.LayerSettings existing))
+                return existing;
+
+            string digits = new string(id.Where(char.IsDigit).ToArray());
+            if (int.TryParse(digits, out int n) && n >= nextExtraId)
+                nextExtraId = n + 1;
+
+            ReentryLayers.LayerSettings l = ReentryLayers.MakeExtraDefault(id, isEdge);
+            extraLayers.Add(l);
+            return l;
+        }
+
+        public void RemoveLayer(ReentryLayers.LayerSettings layer)
+        {
+            if (layer.isOriginal) return; // never remove the real meshes
+            extraLayers.Remove(layer);
+            AeroMesh_DuplicateLayers.DestroyClonesFor(layer);
+        }
+    }
+
+
+    // ============================================================
+    // REENTRY PROFILES - the per-planet registry. Loads profiles
+    // lazily from disk (one file per planet) and tracks which
+    // planet's profile the UI is currently showing/editing, which is
+    // DELIBERATELY separate from whichever planet a given rocket is
+    // actually at during gameplay - editing Moon's preset doesn't
+    // change what renders on a rocket currently re-entering at Earth.
+    // The rendering patches resolve each rocket's own current planet
+    // independently every tick (see ReentryPhysics.GetPlanetCodeName).
+    // ============================================================
+
+    public static class ReentryProfiles
+    {
+        private static readonly Dictionary<string, ReentryProfile> loaded =
+            new Dictionary<string, ReentryProfile>(StringComparer.OrdinalIgnoreCase);
+
+        public static string EditingPlanet { get; private set; } = "Earth";
+
+        public static ReentryProfile GetOrLoad(string planetCodeName)
+        {
+            if (string.IsNullOrEmpty(planetCodeName)) planetCodeName = "Earth";
+            if (!loaded.TryGetValue(planetCodeName, out ReentryProfile profile))
+            {
+                profile = ReentrySaveLoad.Load(planetCodeName);
+                loaded[planetCodeName] = profile;
+            }
+            return profile;
+        }
+
+        public static ReentryProfile Editing => GetOrLoad(EditingPlanet);
+
+        public static void SwitchEditingPlanet(string planetCodeName)
+        {
+            if (string.IsNullOrEmpty(planetCodeName)) return;
+            if (string.Equals(planetCodeName, EditingPlanet, StringComparison.OrdinalIgnoreCase)) return;
+            SaveEditing();
+            EditingPlanet = planetCodeName;
+            GetOrLoad(planetCodeName);
+        }
+
+        public static void SaveEditing() => ReentrySaveLoad.Save(EditingPlanet, Editing);
+
+        /// <summary>Re-reads the editing planet's file from disk, replacing whatever was cached in memory.</summary>
+        public static void ReloadEditing() => loaded[EditingPlanet] = ReentrySaveLoad.Load(EditingPlanet);
+
+        // All planets currently loaded by the game, vanilla and custom
+        // alike - planetLoader.planets is populated from whatever solar
+        // system data is active, so a custom solar system's planets show
+        // up here automatically too.
+        public static List<string> AllPlanetCodeNames()
+        {
+            List<string> names = new List<string>();
+            if (SFS.Base.planetLoader != null && SFS.Base.planetLoader.planets != null)
+                names.AddRange(SFS.Base.planetLoader.planets.Keys);
+            // Do not invent a vanilla Earth entry when the active system
+            // has not populated its planet list yet. The picker is rebuilt
+            // when opened, so it will use the active system once loaded.
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+    }
+
+
+    // ============================================================
+    // BURN PARTICLES - reuses the game's own "effects/Burn"
+    // WorldParticle prefab (already used for things like separator
+    // sparks/debris). The prefab reference/load-failed flag/spawn
+    // accumulator are shared across every planet (loading the same
+    // resource once makes sense regardless of profile); rate/
+    // velocity/spread/enabled now come from whichever profile is
+    // passed in per tick.
+    // ============================================================
+
+    public static class ReentryBurnParticles
+    {
+        private static WorldParticle prefab;
+        private static bool loadFailed;
+        private static float accumulator;
+
+        public static void Tick(AeroModule instance, float temperature, ReentryProfile profile)
+        {
+            if (!profile.particlesEnabled || temperature <= 0f || loadFailed)
                 return;
 
             if (prefab == null)
@@ -433,27 +461,19 @@ namespace SFSMod.Patches
                 }
             }
 
-            accumulator += particlesPerSecond * Time.fixedDeltaTime;
+            accumulator += profile.particlesRate * Time.fixedDeltaTime;
             int count = Mathf.FloorToInt(accumulator);
             if (count <= 0) return;
             accumulator -= count;
 
             Vector3 basePos = instance.reentryEdge.transform.position;
-
-            // FIX: particles need the rocket's own velocity added in, same
-            // as the base game's ParticleModule.Spawn() does (rocket
-            // velocity + a small random spread). Without it, particles
-            // only carry a few m/s of random spread while the rocket
-            // (which the camera follows) can be moving at hundreds or
-            // thousands of m/s during reentry - so they get left behind
-            // almost instantly, reading as "spawn off screen."
             Vector2 rocketVelocity = ReentryPhysics.GetVelocity(instance);
 
             (Vector3, Vector3)[] particles = new (Vector3, Vector3)[count];
             for (int i = 0; i < count; i++)
             {
-                Vector2 offset = UnityEngine.Random.insideUnitCircle * spawnSpread;
-                Vector2 vel = rocketVelocity + UnityEngine.Random.insideUnitCircle * velocityRange;
+                Vector2 offset = UnityEngine.Random.insideUnitCircle * profile.particlesSpread;
+                Vector2 vel = rocketVelocity + UnityEngine.Random.insideUnitCircle * profile.particlesVelocity;
                 particles[i] = (basePos + (Vector3)offset, vel);
             }
             prefab.Spawn(particles);
@@ -465,112 +485,41 @@ namespace SFSMod.Patches
     {
         static void Postfix(AeroModule __instance, float temperature)
         {
-            ReentryBurnParticles.Tick(__instance, temperature);
+            ReentryProfile profile = ReentryProfiles.GetOrLoad(ReentryPhysics.GetPlanetCodeName(__instance));
+            ReentryBurnParticles.Tick(__instance, temperature, profile);
         }
     }
 
 
     // ============================================================
-    // SAVE / LOAD
+    // SAVE / LOAD - one file per planet now: ReentryVisuals_<planet>.txt
     // ============================================================
 
     public static class ReentrySaveLoad
     {
-        private static string FilePath =>
-            System.IO.Path.Combine(SFSMod.MyMod.Main.ModFolder, "ReentryVisuals.txt");
+        private static string FilePath(string planetCodeName) =>
+            System.IO.Path.Combine(SFSMod.MyMod.Main.ModFolder, $"ReentryVisuals_{SanitizeFileName(planetCodeName)}.txt");
 
-        // Baked-in default settings, applied the first time the mod runs
-        // on an install with no ReentryVisuals.txt yet - so a fresh
-        // install starts from this tuned look instead of the bare
-        // hardcoded LayerSettings defaults. Uses the same line format
-        // Save() writes, so it flows through the exact same parsing path.
-        private static readonly string[] DefaultConfig =
+        private static string SanitizeFileName(string name)
         {
-            "layers=outer1,outer2,edge3",
-            "edgeA.hue=-120",
-            "edgeA.brightness=1.5",
-            "edgeA.opacity=1.25",
-            "edgeA.offset=0",
-            "edgeA.speed=0",
-            "edgeA.posx=0",
-            "edgeA.posy=0",
-            "edgeA.width=0.7",
-            "edgeA.length=0.7",
-            "edgeA.fadex=1",
-            "edgeA.fadem=0.9",
-            "edgeA.straightness=-0.15",
-            "edgeA.order=1",
-            "outerA.hue=-20",
-            "outerA.brightness=2.3",
-            "outerA.opacity=0.74",
-            "outerA.offset=0",
-            "outerA.speed=0",
-            "outerA.posx=0",
-            "outerA.posy=0",
-            "outerA.width=0.3",
-            "outerA.length=1",
-            "outerA.fadex=1",
-            "outerA.fadem=1",
-            "outerA.straightness=6",
-            "outerA.order=1",
-            "outer1.kind=outer",
-            "outer1.hue=260",
-            "outer1.brightness=1.2",
-            "outer1.opacity=0.5",
-            "outer1.offset=0",
-            "outer1.speed=0",
-            "outer1.posx=0",
-            "outer1.posy=0",
-            "outer1.width=0.45",
-            "outer1.length=5.249998",
-            "outer1.fadex=1",
-            "outer1.fadem=1",
-            "outer1.straightness=9",
-            "outer1.order=0",
-            "outer2.kind=outer",
-            "outer2.hue=260",
-            "outer2.brightness=1.5",
-            "outer2.opacity=0.8",
-            "outer2.offset=0",
-            "outer2.speed=0",
-            "outer2.posx=0",
-            "outer2.posy=-0.1",
-            "outer2.width=0.1",
-            "outer2.length=0.4",
-            "outer2.fadex=5",
-            "outer2.fadem=1",
-            "outer2.straightness=1",
-            "outer2.order=0",
-            "edge3.kind=edge",
-            "edge3.hue=0",
-            "edge3.brightness=3",
-            "edge3.opacity=1",
-            "edge3.offset=0",
-            "edge3.speed=0",
-            "edge3.posx=0",
-            "edge3.posy=0",
-            "edge3.width=1.1",
-            "edge3.length=1.1",
-            "edge3.fadex=1",
-            "edge3.fadem=1",
-            "edge3.straightness=1",
-            "edge3.order=0",
-            "particles.enabled=0",
-            "particles.rate=20",
-            "particles.velocity=3",
-            "particles.spread=1.2",
-        };
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
 
-        public static void Save()
+        // Defaults for a planet with no ReentryVisuals_<planet>.txt yet come
+        // from BuiltInPresets (Patches/BuiltInPresets.cs). A planet with no
+        // built-in preset starts from the plain hardcoded LayerSettings
+        // defaults with no extra layers. A saved file always overrides these.
+
+        public static void Save(string planetCodeName, ReentryProfile profile)
         {
             try
             {
                 List<string> lines = new List<string>();
+                lines.Add("layers=" + string.Join(",", profile.extraLayers.Select(l => l.id)));
 
-                List<ReentryLayers.LayerSettings> extras = ReentryLayers.extraLayers;
-                lines.Add("layers=" + string.Join(",", extras.Select(l => l.id)));
-
-                foreach (ReentryLayers.LayerSettings layer in ReentryLayers.AllLayers())
+                foreach (ReentryLayers.LayerSettings layer in profile.AllLayers())
                 {
                     if (!layer.isOriginal)
                         lines.Add($"{layer.id}.kind={(layer.isEdge ? "edge" : "outer")}");
@@ -582,32 +531,37 @@ namespace SFSMod.Patches
                     }
                 }
 
-                foreach (string param in ReentryBurnParticles.ParamNames)
+                foreach (string param in ReentryProfile.ParticleParamNames)
                 {
-                    float value = ReentryBurnParticles.GetParam(param);
+                    float value = profile.GetParticleParam(param);
                     lines.Add($"particles.{param}=" + value.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 }
 
-                System.IO.File.WriteAllLines(FilePath, lines);
-                Debug.Log($"[ReentryMod] Saved settings to {FilePath}");
+                string path = FilePath(planetCodeName);
+                System.IO.File.WriteAllLines(path, lines);
+                Debug.Log($"[ReentryMod] Saved {planetCodeName} settings to {path}");
             }
             catch (Exception e)
             {
-                Debug.LogError($"[ReentryMod] Failed to save settings: {e}");
+                Debug.LogError($"[ReentryMod] Failed to save {planetCodeName} settings: {e}");
             }
         }
 
-        public static void Load()
+        public static ReentryProfile Load(string planetCodeName)
         {
+            ReentryProfile profile = new ReentryProfile();
+            string path = FilePath(planetCodeName);
+            bool hasSaveFile = false;
+
             try
             {
-                bool hasSaveFile = System.IO.File.Exists(FilePath);
+                hasSaveFile = System.IO.File.Exists(path);
                 string[] rawLines = hasSaveFile
-                    ? System.IO.File.ReadAllLines(FilePath)
-                    : DefaultConfig;
+                    ? System.IO.File.ReadAllLines(path)
+                    : BuiltInPresets.Get(planetCodeName);
 
                 // First pass: recreate any saved extra layers before
-                // setting their params, so byId lookups below succeed.
+                // setting their params, so ById lookups below succeed.
                 foreach (string rawLine in rawLines)
                 {
                     string line = rawLine.Trim();
@@ -620,7 +574,7 @@ namespace SFSMod.Patches
                             string kindLine = rawLines.FirstOrDefault(l => l.Trim().StartsWith($"{id}.kind="));
                             if (kindLine == null) continue;
                             bool isEdge = kindLine.Trim().EndsWith("edge");
-                            ReentryLayers.EnsureLayer(id, isEdge);
+                            profile.EnsureLayer(id, isEdge);
                         }
                     }
                 }
@@ -648,11 +602,11 @@ namespace SFSMod.Patches
                     {
                         if (float.TryParse(valueText, System.Globalization.NumberStyles.Float,
                                 System.Globalization.CultureInfo.InvariantCulture, out float pv))
-                            ReentryBurnParticles.SetParam(param, pv);
+                            profile.SetParticleParam(param, pv);
                         continue;
                     }
 
-                    if (!ReentryLayers.byId.TryGetValue(scope, out ReentryLayers.LayerSettings layer))
+                    if (!profile.ById.TryGetValue(scope, out ReentryLayers.LayerSettings layer))
                         continue;
 
                     if (!float.TryParse(valueText, System.Globalization.NumberStyles.Float,
@@ -663,13 +617,15 @@ namespace SFSMod.Patches
                 }
 
                 Debug.Log(hasSaveFile
-                    ? $"[ReentryMod] Loaded settings from {FilePath}"
-                    : "[ReentryMod] No saved settings found - applied built-in defaults");
+                    ? $"[ReentryMod] Loaded {planetCodeName} settings from {path}"
+                    : $"[ReentryMod] No saved settings for {planetCodeName} - using {(BuiltInPresets.Has(planetCodeName) ? "built-in" : "plain")} defaults");
             }
             catch (Exception e)
             {
-                Debug.LogError($"[ReentryMod] Failed to load settings: {e}");
+                Debug.LogError($"[ReentryMod] Failed to load {planetCodeName} settings: {e}");
             }
+
+            return profile;
         }
     }
 
@@ -697,8 +653,9 @@ namespace SFSMod.Patches
 
     // ============================================================
     // APPLY VISUAL SETTINGS - fires for ANY AeroMesh.SetTemperature
-    // call, original or clone, since GetSettings now resolves both
-    // via the same map lookup.
+    // call, original or clone, since GetSettings resolves both via
+    // the same per-mesh ownership map (now re-registered every tick
+    // against whichever profile is active for that mesh's rocket).
     // ============================================================
 
     [HarmonyPatch(typeof(AeroMesh), nameof(AeroMesh.SetTemperature))]
@@ -722,6 +679,9 @@ namespace SFSMod.Patches
 
     // ============================================================
     // ORIGINAL LAYER SHAPE TUNING (edgeA / outerA - the real mesh)
+    // Resolves THIS rocket's actual current planet every tick and
+    // uses that planet's profile - independent of whatever planet
+    // the UI happens to be editing right now.
     // ============================================================
 
     [HarmonyPatch(typeof(AeroModule), "FixedUpdate_Reentry_And_Heating")]
@@ -735,36 +695,43 @@ namespace SFSMod.Patches
 
             ReentryBaseShape.CaptureIfNeeded(aeroData);
 
-            // Feed this rocket's real speed into edgeA/outerA before the
-            // game's own SetTemperature calls happen inside the original
-            // method body - ApplyPropertyBlock reads it back afterward.
+            ReentryProfile profile = ReentryProfiles.GetOrLoad(ReentryPhysics.GetPlanetCodeName(__instance));
+
+            // Feed this rocket's real speed and active profile into
+            // edgeA/outerA before the game's own SetTemperature calls
+            // happen inside the original method body - ApplyPropertyBlock
+            // reads both back afterward.
             float speed = ReentryPhysics.GetVelocity(__instance).magnitude;
+            ReentryLayers.SetOwner(__instance.reentryEdge, profile.edgeA);
+            ReentryLayers.SetOwner(__instance.reentryOuter, profile.outerA);
             ReentryLayers.SetCurrentSpeed(__instance.reentryEdge, speed);
             ReentryLayers.SetCurrentSpeed(__instance.reentryOuter, speed);
 
-            aeroData.reentry_Edge.size = ReentryBaseShape.edgeSize * ReentryLayers.edgeA.lengthScale;
-            aeroData.reentry_Edge.side_FadeX = ReentryBaseShape.edgeFadeX * ReentryLayers.edgeA.widthScale * ReentryLayers.edgeA.fadeXScale;
-            aeroData.reentry_Edge.side_FadeM = ReentryBaseShape.edgeFadeM * ReentryLayers.edgeA.widthScale * ReentryLayers.edgeA.fadeMScale;
+            aeroData.reentry_Edge.size = ReentryBaseShape.edgeSize * profile.edgeA.lengthScale;
+            aeroData.reentry_Edge.side_FadeX = ReentryBaseShape.edgeFadeX * profile.edgeA.widthScale * profile.edgeA.fadeXScale;
+            aeroData.reentry_Edge.side_FadeM = ReentryBaseShape.edgeFadeM * profile.edgeA.widthScale * profile.edgeA.fadeMScale;
 
-            aeroData.reentry_Outer.tail_Scale = ReentryBaseShape.tailScale * ReentryLayers.outerA.lengthScale;
-            aeroData.reentry_Outer.side_FadeX = ReentryBaseShape.outerFadeX * ReentryLayers.outerA.widthScale * ReentryLayers.outerA.fadeXScale;
-            aeroData.reentry_Outer.side_FadeM = ReentryBaseShape.outerFadeM * ReentryLayers.outerA.widthScale * ReentryLayers.outerA.fadeMScale;
-            aeroData.reentry_Outer.tail_Acceleration = ReentryBaseShape.tailAcceleration * ReentryLayers.outerA.straightness;
-            aeroData.reentry_Outer.tail_InitialSlope = ReentryBaseShape.tailInitialSlope * ReentryLayers.outerA.straightness;
+            aeroData.reentry_Outer.tail_Scale = ReentryBaseShape.tailScale * profile.outerA.lengthScale;
+            aeroData.reentry_Outer.side_FadeX = ReentryBaseShape.outerFadeX * profile.outerA.widthScale * profile.outerA.fadeXScale;
+            aeroData.reentry_Outer.side_FadeM = ReentryBaseShape.outerFadeM * profile.outerA.widthScale * profile.outerA.fadeMScale;
+            aeroData.reentry_Outer.tail_Acceleration = ReentryBaseShape.tailAcceleration * profile.outerA.straightness;
+            aeroData.reentry_Outer.tail_InitialSlope = ReentryBaseShape.tailInitialSlope * profile.outerA.straightness;
         }
     }
 
 
     // ============================================================
-    // DUPLICATE LAYERS - now handles however many extra layers
-    // exist (List<LayerSettings>), each with its own clone
-    // GameObject per original mesh and its own mesh-shape data.
+    // DUPLICATE LAYERS - iterates whichever profile is active for
+    // THIS rocket's current planet, each tick.
     // ============================================================
 
     [HarmonyPatch(typeof(AeroModule), "FixedUpdate_Reentry_And_Heating")]
     class AeroMesh_DuplicateLayers
     {
         // Per extra layer: which clone belongs to which original AeroMesh.
+        // Keyed by the LayerSettings OBJECT, so different planets' layers
+        // (even ones that happen to share an id like "outer1") never
+        // collide here - each profile has its own distinct objects.
         private static readonly Dictionary<ReentryLayers.LayerSettings, Dictionary<AeroMesh, AeroMesh>> clones =
             new Dictionary<ReentryLayers.LayerSettings, Dictionary<AeroMesh, AeroMesh>>();
 
@@ -772,18 +739,43 @@ namespace SFSMod.Patches
         private static readonly Dictionary<ReentryLayers.LayerSettings, BasicMeshData> meshData =
             new Dictionary<ReentryLayers.LayerSettings, BasicMeshData>();
 
+        // Last time each source AeroMesh was actually processed by the
+        // game's re-entry/heating method. This is deliberately separate
+        // from temperature: teleporting can interrupt the game's normal
+        // re-entry update before temperature reaches zero.
+        private static readonly Dictionary<AeroMesh, float> lastProcessedTime =
+            new Dictionary<AeroMesh, float>();
+
+        internal static void MarkProcessed(AeroMesh original)
+        {
+            if (original != null)
+                lastProcessedTime[original] = Time.unscaledTime;
+        }
+
+        internal static bool WasProcessedRecently(AeroMesh original)
+        {
+            if (original == null) return false;
+
+            float last;
+            if (!lastProcessedTime.TryGetValue(original, out last))
+                return false;
+
+            return Time.unscaledTime - last <= 0.5f;
+        }
+
         static void Postfix(AeroModule __instance, float temperature, List<Surface> exposedSurfaces, float velocityAngleRad, Matrix2x2 localToWorld)
         {
+            // Record that this particular re-entry mesh is still being
+            // updated. If teleportation stops this method from running,
+            // the watchdog attached to its clones will hide them.
+            if (__instance.reentryEdge != null)
+                MarkProcessed(__instance.reentryEdge);
+            if (__instance.reentryOuter != null)
+                MarkProcessed(__instance.reentryOuter);
+
             if (temperature <= 0f)
             {
-                // FIX: previously this just returned, leaving every
-                // already-activated clone permanently active - nothing
-                // ever deactivated them again once reentry ended, unlike
-                // the original meshes (which the base game explicitly
-                // hides via reentryEdge/reentryOuter.SetActive(false) in
-                // AeroModule.FixedUpdate once temperature drops to 0).
-                // That's why extra layers kept showing indefinitely,
-                // even sitting on the launch pad long after any reentry.
+                // Normal end-of-reentry cleanup.
                 foreach (Dictionary<AeroMesh, AeroMesh> perOriginal in clones.Values)
                     foreach (AeroMesh clone in perOriginal.Values)
                         if (clone != null)
@@ -796,6 +788,8 @@ namespace SFSMod.Patches
 
             ReentryBaseShape.CaptureIfNeeded(aeroData);
 
+            ReentryProfile profile = ReentryProfiles.GetOrLoad(ReentryPhysics.GetPlanetCodeName(__instance));
+
             // Same speed value applies to every extra layer on this
             // rocket - computed once per tick here, fed to each clone
             // below (ApplyPropertyBlock reads it back per-mesh).
@@ -803,10 +797,11 @@ namespace SFSMod.Patches
 
             // Copy the extras list since layers can be added/removed
             // (from the UI) between ticks.
-            foreach (ReentryLayers.LayerSettings layer in ReentryLayers.extraLayers.ToList())
+            foreach (ReentryLayers.LayerSettings layer in profile.extraLayers.ToList())
             {
                 AeroMesh original = layer.isEdge ? __instance.reentryEdge : __instance.reentryOuter;
                 AeroMesh clone = GetOrCreateClone(layer, original);
+                ReentryLayers.SetOwner(clone, layer);
                 ReentryLayers.SetCurrentSpeed(clone, speed);
 
                 if (layer.isEdge)
@@ -880,8 +875,17 @@ namespace SFSMod.Patches
             cloneObj.name = original.name + " (" + layer.id + ")";
 
             clone = cloneObj.GetComponent<AeroMesh>();
+
+            // The clone gets its own watchdog because the source
+            // AeroModule can stop receiving re-entry updates abruptly
+            // when a craft is teleported, recovered, switched scenes,
+            // or otherwise moved out of the game's normal heating loop.
+            ReentryCloneWatchdog watchdog = cloneObj.GetComponent<ReentryCloneWatchdog>();
+            if (watchdog == null)
+                watchdog = cloneObj.AddComponent<ReentryCloneWatchdog>();
+            watchdog.Initialize(original);
+
             perOriginal[original] = clone;
-            ReentryLayers.RegisterClone(clone, layer);
             return clone;
         }
 
@@ -907,7 +911,25 @@ namespace SFSMod.Patches
             }
         }
 
-        /// <summary>Called by ReentryLayers.RemoveLayer to clean up a removed layer's GameObjects.</summary>
+        /// <summary>
+        /// Hides all duplicates belonging to one original SFS reentry mesh.
+        /// </summary>
+        internal static void HideClonesForOriginal(AeroMesh original)
+        {
+            if (original == null)
+                return;
+
+            foreach (Dictionary<AeroMesh, AeroMesh> perOriginal in clones.Values)
+            {
+                if (!perOriginal.TryGetValue(original, out AeroMesh clone))
+                    continue;
+
+                if (clone != null)
+                    clone.gameObject.SetActive(false);
+            }
+        }
+
+        /// <summary>Called by ReentryProfile.RemoveLayer to clean up a removed layer's GameObjects.</summary>
         public static void DestroyClonesFor(ReentryLayers.LayerSettings layer)
         {
             if (clones.TryGetValue(layer, out Dictionary<AeroMesh, AeroMesh> perOriginal))
@@ -923,7 +945,76 @@ namespace SFSMod.Patches
 
 
     // ============================================================
-    // CONSOLE COMMANDS
+    // STOCK REENTRY STATE CLEANUP
+    // ============================================================
+    // SFS itself turns the original reentry meshes off at the end of
+    // AeroModule.FixedUpdate when the craft is no longer in reentry.
+    // Our duplicate meshes are separate GameObjects, so they do not
+    // receive that cleanup automatically.
+    //
+    // This is the authoritative cleanup path for teleporting: moving
+    // from mid-reentry directly into orbit can skip the normal
+    // temperature -> 0 transition, but FixedUpdate still sets the real
+    // reentry meshes inactive. We mirror that state for every clone.
+
+    [HarmonyPatch(typeof(AeroModule), "FixedUpdate")]
+    class AeroModule_ReentryCloneCleanup
+    {
+        static void Postfix(AeroModule __instance)
+        {
+            if (__instance == null)
+                return;
+
+            if (__instance.reentryEdge != null &&
+                !__instance.reentryEdge.gameObject.activeSelf)
+            {
+                AeroMesh_DuplicateLayers.HideClonesForOriginal(__instance.reentryEdge);
+            }
+
+            if (__instance.reentryOuter != null &&
+                !__instance.reentryOuter.gameObject.activeSelf)
+            {
+                AeroMesh_DuplicateLayers.HideClonesForOriginal(__instance.reentryOuter);
+            }
+        }
+    }
+
+
+    // ============================================================
+    // CLONE WATCHDOG
+    // ============================================================
+    // A teleport can bypass the normal temperature -> 0 transition.
+    // In that case the source AeroModule may stop running its re-entry
+    // update while the duplicated GameObject is still active.
+    //
+    // The watchdog is intentionally lightweight: it only checks whether
+    // the source mesh still exists and whether the re-entry patch has
+    // processed it recently. If not, the visual clone is immediately
+    // hidden. The next real re-entry update can safely reactivate it.
+
+    public sealed class ReentryCloneWatchdog : MonoBehaviour
+    {
+        private AeroMesh source;
+
+        public void Initialize(AeroMesh sourceMesh)
+        {
+            source = sourceMesh;
+        }
+
+        private void Update()
+        {
+            if (source == null || !source.gameObject.activeInHierarchy ||
+                !AeroMesh_DuplicateLayers.WasProcessedRecently(source))
+            {
+                gameObject.SetActive(false);
+            }
+        }
+    }
+
+
+    // ============================================================
+    // CONSOLE COMMANDS - all operate on ReentryProfiles.Editing (the
+    // planet currently selected in the UI/via "editplanet").
     // ============================================================
 
     public static class ReentryConsoleCommands
@@ -948,45 +1039,53 @@ namespace SFSMod.Patches
 
             Add("rvsave", () =>
             {
-                ReentrySaveLoad.Save();
-                return "Saved Reentry Visuals settings";
+                ReentryProfiles.SaveEditing();
+                return $"Saved {ReentryProfiles.EditingPlanet} settings";
             });
 
             Add("rvload", () =>
             {
-                ReentrySaveLoad.Load();
-                ReentryVisualsUI.RefreshIfBuilt();
-                return "Loaded Reentry Visuals settings";
+                ReentryVisualsUI.ReloadEditingProfile();
+                return $"Loaded {ReentryProfiles.EditingPlanet} settings";
             });
 
             Add("addedge", () =>
             {
-                ReentryLayers.LayerSettings l = ReentryLayers.AddLayer(true);
+                ReentryLayers.LayerSettings l = ReentryProfiles.Editing.AddLayer(true);
                 ReentryVisualsUI.RefreshIfBuilt();
-                return $"Added edge layer '{l.id}'";
+                return $"Added edge layer '{l.id}' to {ReentryProfiles.EditingPlanet}";
             });
 
             Add("addouter", () =>
             {
-                ReentryLayers.LayerSettings l = ReentryLayers.AddLayer(false);
+                ReentryLayers.LayerSettings l = ReentryProfiles.Editing.AddLayer(false);
                 ReentryVisualsUI.RefreshIfBuilt();
-                return $"Added outer layer '{l.id}'";
+                return $"Added outer layer '{l.id}' to {ReentryProfiles.EditingPlanet}";
+            });
+
+            ModLoader.IO.Console.commands.Add(delegate (string s)
+            {
+                Match m = Regex.Match(s, @"^editplanet (\S+)$", RegexOptions.IgnoreCase);
+                if (!m.Success) return false;
+                ReentryVisualsUI.SwitchEditingPlanet(m.Groups[1].Value);
+                ModLoader.IO.Console.main.WriteText($"Now editing {ReentryProfiles.EditingPlanet}");
+                return true;
             });
 
             ModLoader.IO.Console.commands.Add(delegate (string s)
             {
                 Match m = Regex.Match(s, @"^removelayer (\S+)$", RegexOptions.IgnoreCase);
                 if (!m.Success) return false;
-                if (!ReentryLayers.byId.TryGetValue(m.Groups[1].Value, out ReentryLayers.LayerSettings layer))
+                if (!ReentryProfiles.Editing.ById.TryGetValue(m.Groups[1].Value, out ReentryLayers.LayerSettings layer))
                     return false;
                 if (layer.isOriginal)
                 {
                     ModLoader.IO.Console.main.WriteText("Can't remove an original layer");
                     return true;
                 }
-                ReentryLayers.RemoveLayer(layer);
-                ReentryVisualsUI.RefreshIfBuilt();
-                ModLoader.IO.Console.main.WriteText($"Removed layer '{layer.id}'");
+                ReentryProfiles.Editing.RemoveLayer(layer);
+                ReentryVisualsUI.RebuildAllLayerColumns();
+                ModLoader.IO.Console.main.WriteText($"Removed layer '{layer.id}' from {ReentryProfiles.EditingPlanet}");
                 return true;
             });
 
@@ -999,7 +1098,7 @@ namespace SFSMod.Patches
                 );
                 if (!m.Success) return false;
 
-                if (!ReentryLayers.byId.TryGetValue(m.Groups[1].Value, out ReentryLayers.LayerSettings layer))
+                if (!ReentryProfiles.Editing.ById.TryGetValue(m.Groups[1].Value, out ReentryLayers.LayerSettings layer))
                     return false;
 
                 string parameter = m.Groups[2].Value.ToLower();
@@ -1007,7 +1106,7 @@ namespace SFSMod.Patches
                     return false;
 
                 ReentryLayers.SetParam(layer, parameter, value);
-                ModLoader.IO.Console.main.WriteText($"Set {m.Groups[1].Value}.{parameter} = {value}");
+                ModLoader.IO.Console.main.WriteText($"Set {m.Groups[1].Value}.{parameter} = {value} ({ReentryProfiles.EditingPlanet})");
                 return true;
             });
 
@@ -1024,8 +1123,8 @@ namespace SFSMod.Patches
                 if (!float.TryParse(m.Groups[2].Value, out float value))
                     return false;
 
-                ReentryBurnParticles.SetParam(parameter, value);
-                ModLoader.IO.Console.main.WriteText($"Set particles.{parameter} = {value}");
+                ReentryProfiles.Editing.SetParticleParam(parameter, value);
+                ModLoader.IO.Console.main.WriteText($"Set particles.{parameter} = {value} ({ReentryProfiles.EditingPlanet})");
                 return true;
             });
         }
@@ -1049,11 +1148,10 @@ namespace SFSMod.Patches
     public static class ReentryVisualsUI
     {
         const int WindowId = 730104;
-        const int WindowWidth = 560;
+        const int WindowWidth = 640;
         const int WindowHeight = 750;
 
-        const int ColumnWidth = 510;
-        const int ColumnHeight = 880;
+        const int ColumnWidth = 620;
 
         const int LabelWidth = 105;
         const int InputWidth = 190;
@@ -1067,6 +1165,12 @@ namespace SFSMod.Patches
         static ClosableWindow _window;
         static Transform _columnParent;
         static bool _built;
+
+        static Button _planetSwitchButton;
+        static Box _planetListBox;
+        static readonly Dictionary<string, Button> _planetButtons = new Dictionary<string, Button>();
+
+        static GameObject _particlesColumnObj;
 
         static readonly Dictionary<ReentryLayers.LayerSettings, Box> Columns =
             new Dictionary<ReentryLayers.LayerSettings, Box>();
@@ -1095,13 +1199,10 @@ namespace SFSMod.Patches
             Object.DontDestroyOnLoad(obj);
             obj.AddComponent<ReentryVisualsHotkey>();
 
-            // FIX: nothing previously called Load() automatically - saved
-            // settings only ever got applied via the "rvload" console
-            // command or the "Load All" button, so every fresh session
-            // silently started from hardcoded defaults regardless of
-            // what was saved. Load() already no-ops safely if the file
-            // doesn't exist yet, so it's safe to call unconditionally here.
-            ReentrySaveLoad.Load();
+            // Pre-loads Earth's profile (applying built-in defaults if no
+            // save file exists yet) so settings are already in memory
+            // before the player ever opens the panel.
+            ReentryProfiles.GetOrLoad("Earth");
         }
 
         public static void Toggle()
@@ -1121,7 +1222,7 @@ namespace SFSMod.Patches
             // Auto-save on close only - not on every keystroke while open,
             // which would mean a file write per input change.
             if (!willBeVisible)
-                ReentrySaveLoad.Save();
+                ReentryProfiles.SaveEditing();
         }
 
         public static void RefreshIfBuilt()
@@ -1130,9 +1231,10 @@ namespace SFSMod.Patches
 
             // New layers may have appeared (added via console or loaded
             // from a save file) since the panel was built - make sure
-            // every current layer has a column before refreshing values.
+            // every current layer in the EDITING profile has a column
+            // before refreshing values.
             bool addedAny = false;
-            foreach (ReentryLayers.LayerSettings layer in ReentryLayers.AllLayers())
+            foreach (ReentryLayers.LayerSettings layer in ReentryProfiles.Editing.AllLayers())
             {
                 if (!Columns.ContainsKey(layer))
                 {
@@ -1141,11 +1243,6 @@ namespace SFSMod.Patches
                 }
             }
 
-            // FIX: BuildLayerColumn appends at the end, so newly-recreated
-            // layers (e.g. from Load()) were landing AFTER the Add Layer /
-            // Save All / Load All column instead of before it - this was
-            // missing here even though the +Edge/+Outer button handlers
-            // already do it.
             if (addedAny)
                 MoveAddColumnToEnd();
 
@@ -1153,6 +1250,31 @@ namespace SFSMod.Patches
 
             if (addedAny)
                 RebuildScrollLayout();
+        }
+
+        /// <summary>Re-reads the editing planet's file from disk and rebuilds the whole layer/particle section to match.</summary>
+        public static void ReloadEditingProfile()
+        {
+            ReentryProfiles.ReloadEditing();
+            RebuildAllLayerColumns();
+        }
+
+        /// <summary>Saves whatever's currently being edited, switches to a different planet's profile, and rebuilds the UI for it.</summary>
+        public static void SwitchEditingPlanet(string planetCodeName)
+        {
+            if (!_built)
+            {
+                ReentryProfiles.SwitchEditingPlanet(planetCodeName);
+                return;
+            }
+
+            ReentryProfiles.SwitchEditingPlanet(planetCodeName);
+
+            if (_planetSwitchButton != null)
+                _planetSwitchButton.Text = $"Editing: {ReentryProfiles.EditingPlanet}  (tap to switch)";
+            HighlightEditingPlanetButton();
+
+            RebuildAllLayerColumns();
         }
 
         public static void ResetPosition()
@@ -1178,12 +1300,6 @@ namespace SFSMod.Patches
             // savePosition: false above, which is how the window got
             // stuck reloading off-screen after a drag.
 
-            // Switched to Vertical for both layout and scrolling - every
-            // real working example found (yours included) pairs Vertical
-            // layout with Vertical EnableScrolling. Horizontal scrolling
-            // on this framework may just not be a supported/tested path;
-            // this is the confirmed-working pattern instead. Each layer
-            // now stacks top-to-bottom rather than side-by-side.
             _window.CreateLayoutGroup(
                 Type.Vertical, TextAnchor.UpperLeft, ColumnSpacing,
                 new RectOffset(15, 15, 20, 20)
@@ -1193,20 +1309,134 @@ namespace SFSMod.Patches
 
             _columnParent = _window;
 
-            foreach (ReentryLayers.LayerSettings layer in ReentryLayers.AllLayers())
+            BuildPlanetSwitcher(_columnParent);
+
+            foreach (ReentryLayers.LayerSettings layer in ReentryProfiles.Editing.AllLayers())
                 BuildLayerColumn(_columnParent, layer);
 
-            BuildParticlesColumn(_columnParent);
+            BuildParticlesColumn(_columnParent, ReentryProfiles.Editing);
             BuildAddColumn(_columnParent);
 
             RebuildScrollLayout();
         }
 
-        // FIX: forces the scroll content to recompute its height after
-        // columns are added, removed, or reordered at runtime. Without
-        // this the ScrollRect's cached content size can stay smaller
-        // than the actual content, capping how far down it lets you
-        // scroll - short of the Add Layer / Save All / Load All column.
+        // --------------------------------------------------------
+        // PLANET SWITCHER - one button at the top ("Editing: X (tap
+        // to switch)") that toggles a collapsible list of every
+        // planet currently loaded by the game (vanilla and custom),
+        // sourced live from SFS.Base.planetLoader.planets so a custom
+        // solar system's planets appear automatically.
+        // --------------------------------------------------------
+
+        static void BuildPlanetSwitcher(Transform parent)
+        {
+            _planetSwitchButton = Builder.CreateButton(parent, ColumnWidth, 50, 0, 0,
+                TogglePlanetPicker, $"Editing: {ReentryProfiles.EditingPlanet}  (tap to switch)");
+            SetFixedSize(_planetSwitchButton.gameObject, ColumnWidth, 50);
+
+            _planetListBox = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.2f);
+            SetFixedWidthAutoHeight(_planetListBox.gameObject, ColumnWidth);
+            _planetListBox.CreateLayoutGroup(
+                Type.Vertical,
+                TextAnchor.UpperCenter,
+                6f,
+                new RectOffset(10, 10, 10, 10)
+            );
+            _planetListBox.gameObject.SetActive(false);
+
+            RebuildPlanetPicker();
+        }
+
+        /// <summary>
+        /// Rebuilds the picker from the currently loaded SFS planets.
+        /// This runs whenever the picker is opened so entering a custom
+        /// solar system after the UI was created cannot leave a stale list.
+        /// </summary>
+        static void RebuildPlanetPicker()
+        {
+            if (_planetListBox == null)
+                return;
+
+            foreach (Transform child in _planetListBox.gameObject.transform)
+                Object.Destroy(child.gameObject);
+
+            _planetButtons.Clear();
+
+            foreach (string codeName in ReentryProfiles.AllPlanetCodeNames())
+            {
+                string planetCodeName = codeName;
+
+                Button b = Builder.CreateButton(
+                    _planetListBox,
+                    ColumnWidth - 20,
+                    36,
+                    0,
+                    0,
+                    () => SelectPlanet(planetCodeName),
+                    planetCodeName
+                );
+
+                SetFixedSize(b.gameObject, ColumnWidth - 20, 36);
+                _planetButtons[planetCodeName] = b;
+            }
+
+            HighlightEditingPlanetButton();
+            RebuildScrollLayout();
+        }
+
+        static void TogglePlanetPicker()
+        {
+            // Re-query the active solar system every time the button is clicked.
+            RebuildPlanetPicker();
+
+            _planetListBox.gameObject.SetActive(
+                !_planetListBox.gameObject.activeSelf
+            );
+
+            RebuildScrollLayout();
+        }
+
+        static void SelectPlanet(string codeName)
+        {
+            _planetListBox.gameObject.SetActive(false);
+            SwitchEditingPlanet(codeName);
+        }
+
+        static void HighlightEditingPlanetButton()
+        {
+            foreach (KeyValuePair<string, Button> entry in _planetButtons)
+                entry.Value.TextColor = string.Equals(entry.Key, ReentryProfiles.EditingPlanet, StringComparison.OrdinalIgnoreCase)
+                    ? Color.yellow
+                    : Color.white;
+        }
+
+        /// <summary>Tears down and rebuilds every layer column + the particles column from ReentryProfiles.Editing - used after switching or reloading a profile.</summary>
+        public static void RebuildAllLayerColumns()
+        {
+            if (!_built) return;
+
+            foreach (Box column in Columns.Values)
+                if (column != null) Object.Destroy(column.gameObject);
+            Columns.Clear();
+            Inputs.Clear();
+            Defaults.Clear();
+            ParticleInputs.Clear();
+
+            if (_particlesColumnObj != null) Object.Destroy(_particlesColumnObj);
+
+            ReentryProfile profile = ReentryProfiles.Editing;
+            foreach (ReentryLayers.LayerSettings layer in profile.AllLayers())
+                BuildLayerColumn(_columnParent, layer);
+
+            BuildParticlesColumn(_columnParent, profile);
+            MoveAddColumnToEnd();
+            RebuildScrollLayout();
+        }
+
+        // Forces the scroll content to recompute its height after columns
+        // are added, removed, or reordered at runtime. Without this the
+        // ScrollRect's cached content size can stay smaller than the
+        // actual content, capping how far down it lets you scroll.
         static void RebuildScrollLayout()
         {
             if (_columnParent is RectTransform rt)
@@ -1215,16 +1445,6 @@ namespace SFSMod.Patches
 
         static void BuildLayerColumn(Transform parent, ReentryLayers.LayerSettings layer)
         {
-            // FIX: previously passed ColumnHeight (880) here directly at
-            // construction time, before SetFixedWidthAutoHeight's
-            // ContentSizeFitter ever ran - if CreateBox sizes its own
-            // background visual from these constructor args immediately,
-            // that background could stay at the old oversized height even
-            // after the fitter later shrinks the RectTransform used for
-            // positioning, leaving a leftover background-colored gap. A
-            // small placeholder here (and in BuildParticlesColumn /
-            // BuildAddColumn below) means there's nothing oversized left
-            // for the fitter to disagree with.
             Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.15f);
             SetFixedWidthAutoHeight(column.gameObject, ColumnWidth);
             column.CreateLayoutGroup(Type.Vertical, TextAnchor.UpperCenter, RowSpacing, new RectOffset(10, 10, 15, 15));
@@ -1280,25 +1500,22 @@ namespace SFSMod.Patches
             }
         }
 
-        static void BuildParticlesColumn(Transform parent)
+        static void BuildParticlesColumn(Transform parent, ReentryProfile profile)
         {
-            // Compact height (4 rows, not 11 like a full layer panel) -
-            // same reasoning as BuildAddColumn above.
-            const int particlesBoxHeight = 380;
-
             Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.15f);
             SetFixedWidthAutoHeight(column.gameObject, ColumnWidth);
             column.CreateLayoutGroup(Type.Vertical, TextAnchor.UpperCenter, RowSpacing, new RectOffset(10, 10, 15, 15));
+            _particlesColumnObj = column.gameObject;
 
             Builder.CreateLabel(column, ColumnWidth - 20, 40, 0, 0, "Burn Particles");
 
-            BuildParticleRow(column, "Enabled", "enabled", 1f, ReentryBurnParticles.enabled ? 1f : 0f);
-            BuildParticleRow(column, "Rate/sec", "rate", 1f, ReentryBurnParticles.particlesPerSecond);
-            BuildParticleRow(column, "Velocity", "velocity", 0.1f, ReentryBurnParticles.velocityRange);
-            BuildParticleRow(column, "Spread", "spread", 0.1f, ReentryBurnParticles.spawnSpread);
+            BuildParticleRow(column, profile, "Enabled", "enabled", 1f, profile.particlesEnabled ? 1f : 0f);
+            BuildParticleRow(column, profile, "Rate/sec", "rate", 1f, profile.particlesRate);
+            BuildParticleRow(column, profile, "Velocity", "velocity", 0.1f, profile.particlesVelocity);
+            BuildParticleRow(column, profile, "Spread", "spread", 0.1f, profile.particlesSpread);
         }
 
-        static void BuildParticleRow(Transform parent, string label, string parameter, float step, float value)
+        static void BuildParticleRow(Transform parent, ReentryProfile profile, string label, string parameter, float step, float value)
         {
             Container row = Builder.CreateContainer(parent);
             SetFixedSize(row.gameObject, ColumnWidth - 20, FieldHeight);
@@ -1310,14 +1527,11 @@ namespace SFSMod.Patches
             SetFixedSize(input.gameObject, InputWidth, FieldHeight);
 
             ParticleInputs[parameter] = input;
-            input.OnValueChangedEvent += newValue => ReentryBurnParticles.SetParam(parameter, newValue);
+            input.OnValueChangedEvent += newValue => profile.SetParticleParam(parameter, newValue);
         }
 
         static void BuildAddColumn(Transform parent)
         {
-            // Compact height now (not the full ColumnHeight) - it's just
-            // a handful of buttons, and in a vertical stack a near-empty
-            // box the same height as a full parameter panel would look odd.
             const int addBoxHeight = 300;
 
             Box column = Builder.CreateBox(parent, ColumnWidth, 10, opacity: 0.1f);
@@ -1330,7 +1544,7 @@ namespace SFSMod.Patches
 
             Builder.CreateButton(column, ColumnWidth - 20, 50, 0, 0, () =>
             {
-                ReentryLayers.LayerSettings l = ReentryLayers.AddLayer(true);
+                ReentryLayers.LayerSettings l = ReentryProfiles.Editing.AddLayer(true);
                 BuildLayerColumn(_columnParent, l);
                 MoveAddColumnToEnd();
                 RebuildScrollLayout();
@@ -1338,7 +1552,7 @@ namespace SFSMod.Patches
 
             Builder.CreateButton(column, ColumnWidth - 20, 50, 0, 0, () =>
             {
-                ReentryLayers.LayerSettings l = ReentryLayers.AddLayer(false);
+                ReentryLayers.LayerSettings l = ReentryProfiles.Editing.AddLayer(false);
                 BuildLayerColumn(_columnParent, l);
                 MoveAddColumnToEnd();
                 RebuildScrollLayout();
@@ -1348,13 +1562,12 @@ namespace SFSMod.Patches
 
             Builder.CreateButton(column, ColumnWidth - 20, 50, 0, 0, () =>
             {
-                ReentrySaveLoad.Save();
+                ReentryProfiles.SaveEditing();
             }, "Save All");
 
             Builder.CreateButton(column, ColumnWidth - 20, 50, 0, 0, () =>
             {
-                ReentrySaveLoad.Load();
-                RefreshIfBuilt();
+                ReloadEditingProfile();
             }, "Load All");
         }
 
@@ -1380,15 +1593,6 @@ namespace SFSMod.Patches
             layout.flexibleHeight = 0;
         }
 
-        // FIX: previously every column Box used SetFixedSize with a
-        // hardcoded height guess (ColumnHeight=880, particlesBoxHeight=380,
-        // addBoxHeight=300). Those constants were never updated when
-        // LayerSettings grew to 13 rows, so a box's forced height didn't
-        // match what its rows actually needed - leaving blank space below
-        // the real content (before the next section), which pushed
-        // everything after it (including "Load All") further down than
-        // the true content height, off the bottom of the scroll view.
-        // This lets a box size itself to its actual content instead.
         static void SetFixedWidthAutoHeight(GameObject obj, float width)
         {
             LayoutElement layout = obj.GetOrAddComponent<LayoutElement>();
@@ -1425,7 +1629,7 @@ namespace SFSMod.Patches
 
         static void RemoveLayerFromUI(ReentryLayers.LayerSettings layer)
         {
-            ReentryLayers.RemoveLayer(layer);
+            ReentryProfiles.Editing.RemoveLayer(layer);
 
             if (Columns.TryGetValue(layer, out Box column))
             {
@@ -1470,8 +1674,9 @@ namespace SFSMod.Patches
                 foreach (KeyValuePair<string, NumberInput> inputEntry in layerEntry.Value)
                     inputEntry.Value.Value = ReentryLayers.GetParam(layerEntry.Key, inputEntry.Key);
 
+            ReentryProfile profile = ReentryProfiles.Editing;
             foreach (KeyValuePair<string, NumberInput> entry in ParticleInputs)
-                entry.Value.Value = ReentryBurnParticles.GetParam(entry.Key);
+                entry.Value.Value = profile.GetParticleParam(entry.Key);
         }
     }
 
@@ -1487,3 +1692,4 @@ namespace SFSMod.Patches
         }
     }
 }
+    
